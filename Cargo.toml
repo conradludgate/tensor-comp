@@ -10,3 +10,5 @@ edition = "2021"
 llvm-sys = { version = "181" }
 logos = "0.14.0"
 ariadne = { version = "0.4.0", features = [] }
+typed-arena = "2.0.2"
+lasso = "0.7.2"
