@@ -9,3 +9,4 @@ edition = "2021"
 # inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm18-0"] }
 llvm-sys = { version = "181" }
 logos = "0.14.0"
+ariadne = { version = "0.4.0", features = [] }
