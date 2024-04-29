@@ -1,6 +1,6 @@
-use ariadne::{Label, Report, Span as ISpan};
+use ariadne::{Label, Report};
 use bumpalo::Bump;
-use chumsky::{input::Input, Parser};
+use chumsky::{input::Input, span::Span as ISpan, Parser};
 use logos::Logos;
 
 use crate::{
@@ -51,7 +51,7 @@ fn main() {
         match token {
             Ok(token) => tokens.push((token, span)),
             Err(e) => errors.push(
-                Report::build(ariadne::ReportKind::Error, file, span.start())
+                Report::build(ariadne::ReportKind::Error, file, span.start() as usize)
                     .with_label(Label::new(span).with_message(e))
                     .finish(),
             ),
@@ -60,7 +60,7 @@ fn main() {
     let eoi = Span::new(file, src.len()..src.len());
     if lex.extras.depth != 0 {
         errors.push(
-            Report::build(ariadne::ReportKind::Error, file, eoi.start())
+            Report::build(ariadne::ReportKind::Error, file, eoi.start() as usize)
                 .with_label(Label::new(eoi).with_message(token::Error::UnbalancedParen))
                 .finish(),
         )
@@ -79,6 +79,25 @@ fn main() {
     };
 
     let tokens = tokens.as_slice().spanned(eoi).with_context(file);
-    let file = parse_file().parse_with_state(tokens, &mut state).unwrap();
-    dbg_pls::color!(file);
+    match parse_file()
+        .parse_with_state(tokens, &mut state)
+        .into_result()
+    {
+        Ok(file) => {
+            dbg_pls::color!(file);
+        }
+        Err(errors) => {
+            for error in errors {
+                Report::build(
+                    ariadne::ReportKind::Error,
+                    error.span().context(),
+                    error.span().start() as usize,
+                )
+                .with_label(Label::new(*error.span()).with_message(format!("{error:?}")))
+                .finish()
+                .eprint(&mut files)
+                .unwrap();
+            }
+        }
+    };
 }
