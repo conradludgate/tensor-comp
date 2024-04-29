@@ -1,5 +1,6 @@
 use core::fmt;
 use std::{
+    cmp::{self, Ordering},
     collections::HashMap,
     iter::Sum,
     num::{NonZeroU16, NonZeroU32},
@@ -80,17 +81,25 @@ enum SyntaxNode<'arena> {
     Int(i64, Span),
     Infer(Span),
     Ident(Ident, Span),
+    Func {
+        name: Ident,
+        args: &'arena SyntaxNode<'arena>,
+        types: &'arena SyntaxNode<'arena>,
+        body: &'arena SyntaxNode<'arena>,
+        span: Span,
+    },
     List(&'arena [SyntaxNode<'arena>], Span),
 }
 
 impl SyntaxNode<'_> {
     fn span(&self) -> Span {
         match self {
-            SyntaxNode::Float(_, span) => *span,
-            SyntaxNode::Int(_, span) => *span,
-            SyntaxNode::Infer(span) => *span,
-            SyntaxNode::Ident(_, span) => *span,
-            SyntaxNode::List(_, span) => *span,
+            Self::Float(_, span) => *span,
+            Self::Int(_, span) => *span,
+            Self::Infer(span) => *span,
+            Self::Ident(_, span) => *span,
+            Self::List(_, span) => *span,
+            Self::Func { span, .. } => *span,
         }
     }
 }
@@ -218,8 +227,7 @@ fn main() {
     let (file, src) = files.insert(
         "example.tensor",
         "
-(def mnist
-    (state batch input)
+(func mnist (state batch input)
     (
         (join (dense_state _ _) (dense_state _ _) (dense_state _ _))
         natural
@@ -247,6 +255,8 @@ fn main() {
     let mut syntax_tree_stack = vec![];
     let mut interner = Rodeo::<Ident>::new();
 
+    let func = interner.get_or_intern_static("func");
+
     while let Some(token) = lex.next() {
         let span = Span::new(file, lex.span());
         match token {
@@ -258,7 +268,32 @@ fn main() {
                     .chain(list.iter().map(|x| x.span()))
                     .chain(std::iter::once(span))
                     .sum();
-                syntax_tree_stack.push(SyntaxNode::List(&*list, list_span));
+
+                match &*list {
+                    [SyntaxNode::Ident(f, _), SyntaxNode::Ident(name, _), args, types, body]
+                        if *f == func =>
+                    {
+                        syntax_tree_stack.push(SyntaxNode::Func {
+                            name: *name,
+                            args,
+                            types,
+                            body,
+                            span: list_span,
+                        });
+                    }
+                    [SyntaxNode::Ident(f, _), ..] if *f == func => {
+                        errors.push(
+                            Report::build(ariadne::ReportKind::Error, file, 0)
+                                .with_label(Label::new(list_span).with_message(
+                                    "invalid function definition. expected `func <name> (<args>...) (<types>...) (<body>...)`",
+                                ))
+                                .finish(),
+                        )
+                    },
+                    list => {
+                        syntax_tree_stack.push(SyntaxNode::List(list, list_span))
+                    }
+                }
             }
             Ok(Token::Ident) => {
                 syntax_tree_stack
@@ -293,7 +328,11 @@ fn main() {
     }
 
     let file_list = syntax_tree_arena.alloc_extend(syntax_tree_stack.drain(..));
-    let file_span = file_list.iter().map(|x| x.span()).sum();
+    let file_span = file_list
+        .iter()
+        .map(|x| x.span())
+        .reduce(Span::join)
+        .unwrap_or(Span(file, 0, 0));
     let file_list = SyntaxNode::List(&*file_list, file_span);
     dbg!(file_list);
 
