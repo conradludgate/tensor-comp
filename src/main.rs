@@ -1,33 +1,68 @@
 use core::fmt;
 use std::{
-    cmp::{self, Ordering},
     collections::HashMap,
-    iter::Sum,
     num::{NonZeroU16, NonZeroU32},
     ops::Range,
+    str::FromStr,
 };
 
 use ariadne::{Cache, Label, Report, Source};
+use bumpalo::Bump;
+use chumsky::{
+    error::{Error as ChumskyError, Rich},
+    extra::Full,
+    input::{Input, SpannedInput, WithContext},
+    primitive::{choice, custom, just},
+    recursive::recursive,
+    util::Maybe,
+    IterParser, Parser,
+};
 use lasso::Rodeo;
 use logos::{Lexer, Logos};
-use typed_arena::Arena;
 
-#[derive(Default)]
 struct Extra {
     depth: usize,
+    idents: Rodeo<Ident>,
+}
+
+impl Default for Extra {
+    fn default() -> Self {
+        Self {
+            depth: 0,
+            idents: Rodeo::new(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Default)]
 enum Error {
     UnbalancedParen,
+    Overflow,
     #[default]
     UnexpectedCharacter,
+}
+
+impl From<std::num::ParseIntError> for Error {
+    fn from(value: std::num::ParseIntError) -> Self {
+        match value.kind() {
+            std::num::IntErrorKind::PosOverflow => Self::Overflow,
+            std::num::IntErrorKind::NegOverflow => Self::Overflow,
+            _ => Self::UnexpectedCharacter,
+        }
+    }
+}
+
+impl From<std::num::ParseFloatError> for Error {
+    fn from(_: std::num::ParseFloatError) -> Self {
+        Self::Overflow
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnbalancedParen => f.write_str("unbalanced parentheses"),
+            Error::Overflow => f.write_str("number was too large to be represented"),
             Error::UnexpectedCharacter => f.write_str("unexpected character"),
         }
     }
@@ -35,73 +70,52 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Logos, Debug, PartialEq)]
+#[derive(Logos, Debug, PartialEq, Clone, Copy)]
 #[logos(skip r"[ \t\n\f]+")] // Ignore this regex pattern between tokens
 #[logos(extras = Extra)]
 #[logos(error = Error)]
 enum Token {
     #[token("(", depth_inc)]
-    Open(usize),
+    Open,
 
     #[token(")", depth_dec)]
-    Close(usize),
+    Close,
 
     #[regex("_", priority = 3)]
     Infer,
 
-    #[regex(r"[0-9]+\.[0-9]+", priority = 2)]
-    Float,
+    #[regex(r"[0-9]+\.[0-9]+", parse, priority = 2)]
+    Float(f64),
 
-    #[regex(r"[0-9]+", priority = 1)]
-    Int,
+    #[regex(r"[0-9]+", parse, priority = 1)]
+    Int(i64),
 
-    #[regex("[a-zA-Z_][a-zA-Z0-9_]*")]
-    Ident,
+    #[regex("[a-zA-Z_][a-zA-Z0-9_]*", ident)]
+    Ident(Ident),
 }
 
-fn depth_inc(lex: &mut Lexer<Token>) -> usize {
-    let depth = lex.extras.depth;
+fn depth_inc(lex: &mut Lexer<Token>) {
     lex.extras.depth += 1;
-    depth
 }
 
-fn depth_dec(lex: &mut Lexer<Token>) -> Result<usize, Error> {
-    let depth = lex
+fn depth_dec(lex: &mut Lexer<Token>) -> Result<(), Error> {
+    lex.extras.depth = lex
         .extras
         .depth
         .checked_sub(1)
         .ok_or(Error::UnbalancedParen)?;
-    lex.extras.depth = depth;
-    Ok(depth)
+    Ok(())
 }
 
-#[derive(Debug)]
-enum SyntaxNode<'arena> {
-    Float(f64, Span),
-    Int(i64, Span),
-    Infer(Span),
-    Ident(Ident, Span),
-    Func {
-        name: Ident,
-        args: &'arena SyntaxNode<'arena>,
-        types: &'arena SyntaxNode<'arena>,
-        body: &'arena SyntaxNode<'arena>,
-        span: Span,
-    },
-    List(&'arena [SyntaxNode<'arena>], Span),
+fn ident(lex: &mut Lexer<Token>) -> Ident {
+    lex.extras.idents.get_or_intern(lex.slice())
 }
 
-impl SyntaxNode<'_> {
-    fn span(&self) -> Span {
-        match self {
-            Self::Float(_, span) => *span,
-            Self::Int(_, span) => *span,
-            Self::Infer(span) => *span,
-            Self::Ident(_, span) => *span,
-            Self::List(_, span) => *span,
-            Self::Func { span, .. } => *span,
-        }
-    }
+fn parse<P: FromStr>(lex: &mut Lexer<Token>) -> Result<P, Error>
+where
+    Error: From<P::Err>,
+{
+    Ok(lex.slice().parse()?)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -115,18 +129,27 @@ impl Span {
             span.end.try_into().expect("file too large"),
         )
     }
-
-    fn join(self, other: Self) -> Self {
-        assert_eq!(self.0, other.0);
-        let min = self.1.min(other.1);
-        let max = self.2.max(other.2);
-        Self(self.0, min, max)
-    }
 }
 
-impl Sum<Span> for Span {
-    fn sum<I: Iterator<Item = Span>>(iter: I) -> Self {
-        iter.into_iter().reduce(Self::join).unwrap()
+impl chumsky::span::Span for Span {
+    type Context = File;
+
+    type Offset = u32;
+
+    fn new(context: Self::Context, range: Range<Self::Offset>) -> Self {
+        Self(context, range.start, range.end)
+    }
+
+    fn context(&self) -> Self::Context {
+        self.0
+    }
+
+    fn start(&self) -> Self::Offset {
+        self.1
+    }
+
+    fn end(&self) -> Self::Offset {
+        self.2
     }
 }
 
@@ -148,6 +171,8 @@ impl ariadne::Span for Span {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct Ident(NonZeroU32);
+
+#[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 struct File(NonZeroU16);
 
@@ -249,96 +274,203 @@ fn main() {
     );
 
     let mut lex = Token::lexer(src);
-
-    let syntax_tree_arena = Arena::<SyntaxNode>::new();
-    let mut len_stack = vec![];
-    let mut syntax_tree_stack = vec![];
-    let mut interner = Rodeo::<Ident>::new();
-
-    let func = interner.get_or_intern_static("func");
-
+    let mut tokens = vec![];
     while let Some(token) = lex.next() {
         let span = Span::new(file, lex.span());
         match token {
-            Ok(Token::Open(_)) => len_stack.push((syntax_tree_stack.len(), span)),
-            Ok(Token::Close(_)) => {
-                let (n, open_span) = len_stack.pop().unwrap();
-                let list = syntax_tree_arena.alloc_extend(syntax_tree_stack.drain(n..));
-                let list_span = std::iter::once(open_span)
-                    .chain(list.iter().map(|x| x.span()))
-                    .chain(std::iter::once(span))
-                    .sum();
-
-                match &*list {
-                    [SyntaxNode::Ident(f, _), SyntaxNode::Ident(name, _), args, types, body]
-                        if *f == func =>
-                    {
-                        syntax_tree_stack.push(SyntaxNode::Func {
-                            name: *name,
-                            args,
-                            types,
-                            body,
-                            span: list_span,
-                        });
-                    }
-                    [SyntaxNode::Ident(f, _), ..] if *f == func => {
-                        errors.push(
-                            Report::build(ariadne::ReportKind::Error, file, 0)
-                                .with_label(Label::new(list_span).with_message(
-                                    "invalid function definition. expected `func <name> (<args>...) (<types>...) (<body>...)`",
-                                ))
-                                .finish(),
-                        )
-                    },
-                    list => {
-                        syntax_tree_stack.push(SyntaxNode::List(list, list_span))
-                    }
-                }
-            }
-            Ok(Token::Ident) => {
-                syntax_tree_stack
-                    .push(SyntaxNode::Ident(interner.get_or_intern(lex.slice()), span));
-            }
-            Ok(Token::Infer) => {
-                syntax_tree_stack
-                    .push(SyntaxNode::Ident(interner.get_or_intern(lex.slice()), span));
-            }
-            Ok(Token::Int) => match lex.slice().parse() {
-                Ok(int) => syntax_tree_stack.push(SyntaxNode::Int(int, span)),
-                Err(e) => errors.push(
-                    Report::build(ariadne::ReportKind::Error, file, 0)
-                        .with_label(Label::new(span).with_message(e))
-                        .finish(),
-                ),
-            },
-            Ok(Token::Float) => match lex.slice().parse() {
-                Ok(float) => syntax_tree_stack.push(SyntaxNode::Float(float, span)),
-                Err(e) => errors.push(
-                    Report::build(ariadne::ReportKind::Error, file, 0)
-                        .with_label(Label::new(span).with_message(e))
-                        .finish(),
-                ),
-            },
+            Ok(token) => tokens.push((token, span)),
             Err(e) => errors.push(
-                Report::build(ariadne::ReportKind::Error, file, 0)
+                Report::build(ariadne::ReportKind::Error, file, span.1 as usize)
                     .with_label(Label::new(span).with_message(e))
                     .finish(),
             ),
         }
     }
 
-    let file_list = syntax_tree_arena.alloc_extend(syntax_tree_stack.drain(..));
-    let file_span = file_list
-        .iter()
-        .map(|x| x.span())
-        .reduce(Span::join)
-        .unwrap_or(Span(file, 0, 0));
-    let file_list = SyntaxNode::List(&*file_list, file_span);
-    dbg!(file_list);
-
     if !errors.is_empty() {
         for error in errors {
             error.eprint(&mut files).unwrap();
         }
+        return;
+    }
+
+    let mut state = State {
+        bump: &Bump::new(),
+        func: lex.extras.idents.get_or_intern_static("func"),
+    };
+
+    let eoi = Span(file, src.len() as u32, src.len() as u32);
+    let tokens = tokens.as_slice().spanned(eoi).with_context(file);
+    let file = parse_file().parse_with_state(tokens, &mut state).unwrap();
+    dbg_pls::color!(file);
+}
+
+type Tokens<'src> = WithContext<Span, SpannedInput<Token, Span, &'src [(Token, Span)]>>;
+
+struct State<'bump> {
+    bump: &'bump bumpalo::Bump,
+    func: Ident,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Context {}
+
+type E<'src, 'bump> = Full<Rich<'src, Token, Span>, State<'bump>, Context>;
+
+trait IterParserExt<'src, 'bump: 'src, O: 'bump>:
+    IterParser<'src, Tokens<'src>, O, E<'src, 'bump>> + Clone
+{
+    fn collect_bump_vec(
+        self,
+    ) -> impl Parser<'src, Tokens<'src>, bumpalo::collections::Vec<'bump, O>, E<'src, 'bump>> + Clone
+    {
+        let vec =
+            custom::<_, _, _, E>(|input| Ok(bumpalo::collections::Vec::new_in(input.state().bump)));
+
+        vec.foldl(self, |mut vec, item| {
+            vec.push(item);
+            vec
+        })
+    }
+}
+
+impl<'src, 'bump: 'src, O: 'bump, P> IterParserExt<'src, 'bump, O> for P where
+    P: IterParser<'src, Tokens<'src>, O, E<'src, 'bump>> + Clone
+{
+}
+
+fn parse_file<'src, 'bump: 'src>(
+) -> impl Parser<'src, Tokens<'src>, FileNode<'bump>, E<'src, 'bump>> + Clone {
+    parse_func()
+        .repeated()
+        .collect_bump_vec()
+        .map(|vec| FileNode(vec.into_bump_slice()))
+}
+
+fn parse_func<'src, 'bump: 'src>(
+) -> impl Parser<'src, Tokens<'src>, FuncNode<'bump>, E<'src, 'bump>> + Clone {
+    just(Token::Open)
+        .ignore_then(parse_ident_exact(|s| s.func))
+        .ignore_then(parse_ident())
+        .then(parse_list(parse_ident_or_infer()))
+        .then(parse_list(parse_expr()))
+        .then(parse_expr())
+        .then_ignore(just(Token::Close))
+        .map(|(((name, args), types), body)| FuncNode {
+            name,
+            args,
+            types,
+            body,
+        })
+}
+
+fn parse_ident_exact<'src, 'bump: 'src>(
+    ident_from_state: impl for<'a> Fn(&'a State) -> Ident + Clone,
+) -> impl Parser<'src, Tokens<'src>, Ident, E<'src, 'bump>> + Clone {
+    custom::<_, _, _, E>(move |input| {
+        let expected = ident_from_state(input.state());
+        let before = input.offset();
+        match input.next() {
+            Some(Token::Ident(ident)) if ident == expected => Ok(ident),
+            token => {
+                let span = input.span_since(before);
+                Err(<Rich<_, _, _> as ChumskyError<Tokens>>::expected_found(
+                    [Some(Maybe::Val(Token::Ident(expected)))],
+                    token.map(Maybe::Val),
+                    span,
+                ))
+            }
+        }
+    })
+}
+
+fn parse_ident_or_infer<'src, 'bump: 'src>(
+) -> impl Parser<'src, Tokens<'src>, Option<Ident>, E<'src, 'bump>> + Clone {
+    parse_ident().map(Some).or(just(Token::Infer).map(|_| None))
+}
+
+fn parse_ident<'src, 'bump: 'src>() -> impl Parser<'src, Tokens<'src>, Ident, E<'src, 'bump>> + Clone
+{
+    custom::<_, _, _, E>(|input| {
+        let before = input.offset();
+        match input.next() {
+            Some(Token::Ident(ident)) => Ok(ident),
+            None => {
+                let span = input.span_since(before);
+                Err(Rich::custom(span, "found end of input expected identifier"))
+            }
+            Some(token) => {
+                let span = input.span_since(before);
+                Err(Rich::custom(
+                    span,
+                    format!("found {token:?} expected identifier"),
+                ))
+            }
+        }
+    })
+}
+
+fn parse_int<'src, 'bump: 'src>() -> impl Parser<'src, Tokens<'src>, i64, E<'src, 'bump>> + Clone {
+    custom::<_, _, _, E>(|input| {
+        let before = input.offset();
+        match input.next() {
+            Some(Token::Int(int)) => Ok(int),
+            None => {
+                let span = input.span_since(before);
+                Err(Rich::custom(span, "found end of input expected integer"))
+            }
+            Some(token) => {
+                let span = input.span_since(before);
+                Err(Rich::custom(
+                    span,
+                    format!("found {token:?} expected integer"),
+                ))
+            }
+        }
+    })
+}
+
+fn parse_expr<'src, 'bump: 'src>(
+) -> impl Parser<'src, Tokens<'src>, Expr<'bump>, E<'src, 'bump>> + Clone {
+    recursive(|expr| {
+        choice((
+            parse_ident().map(Expr::Ident),
+            just(Token::Infer).map(|_| Expr::Infer),
+            parse_int().map(Expr::Int),
+            parse_list(expr).map(Expr::List),
+        ))
+    })
+}
+
+fn parse_list<'src, 'bump: 'src, O: 'bump>(
+    p: impl Parser<'src, Tokens<'src>, O, E<'src, 'bump>> + Clone,
+) -> impl Parser<'src, Tokens<'src>, &'bump [O], E<'src, 'bump>> + Clone {
+    just(Token::Open)
+        .ignore_then(p.repeated().collect_bump_vec().map(|v| v.into_bump_slice()))
+        .then_ignore(just(Token::Close))
+}
+
+#[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
+struct FileNode<'bump>(&'bump [FuncNode<'bump>]);
+#[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
+struct FuncNode<'bump> {
+    name: Ident,
+    args: &'bump [Option<Ident>],
+    types: &'bump [Expr<'bump>],
+    body: Expr<'bump>,
+}
+
+#[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
+enum Expr<'bump> {
+    Ident(Ident),
+    Infer,
+    // Float(f64),
+    Int(i64),
+    List(&'bump [Expr<'bump>]),
+}
+
+impl dbg_pls::DebugPls for Ident {
+    fn fmt(&self, f: dbg_pls::Formatter<'_>) {
+        f.debug_ident("Ident")
     }
 }

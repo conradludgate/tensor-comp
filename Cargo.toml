@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["_debugging"]
+_debugging = ["dep:dbg-pls"]
+
 [dependencies]
 # inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm18-0"] }
 llvm-sys = { version = "181" }
@@ -12,3 +16,7 @@ logos = "0.14.0"
 ariadne = { version = "0.4.0", features = [] }
 typed-arena = "2.0.2"
 lasso = "0.7.2"
+chumsky = "1.0.0-alpha.7"
+bumpalo = { version = "3.16.0", features = ["collections"] }
+
+dbg-pls = { version = "0.4", features = ["derive", "colors"], optional = true }
