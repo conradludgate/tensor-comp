@@ -4,6 +4,7 @@ use chumsky::{
     input::{SpannedInput, WithContext},
     primitive::{choice, custom, just},
     recursive::recursive,
+    select,
     util::Maybe,
 };
 
@@ -45,22 +46,22 @@ impl<'src, 'bump: 'src, O: 'bump, P> IterParserExt<'src, 'bump, O> for P where
 {
 }
 
-pub fn parse_file<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, FileNode<'bump>> {
+pub fn parse_file<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, File<'bump>> {
     parse_func()
         .repeated()
         .collect_bump_vec()
-        .map(|vec| FileNode(vec.into_bump_slice()))
+        .map(|vec| File(vec.into_bump_slice()))
 }
 
-fn parse_func<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, FuncNode<'bump>> {
+fn parse_func<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Func<'bump>> {
     just(Token::Open)
         .ignore_then(parse_ident_exact(|s| s.func))
         .ignore_then(parse_ident())
         .then(parse_list(parse_ident_or_infer()))
         .then(parse_list(parse_expr()))
-        .then(parse_expr())
+        .then(parse_func_body())
         .then_ignore(just(Token::Close))
-        .map(|(((name, args), types), body)| FuncNode {
+        .map(|(((name, args), types), body)| Func {
             name,
             args,
             types,
@@ -89,27 +90,16 @@ fn parse_ident_exact<'src, 'bump: 'src>(
 }
 
 fn parse_ident_or_infer<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Option<Ident>> {
-    parse_ident().map(Some).or(just(Token::Infer).map(|_| None))
+    select! {
+        Token::Ident(ident) => Some(ident),
+        Token::Infer => None,
+    }
 }
 
 fn parse_ident<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Ident> {
-    custom::<_, _, _, Extras>(|input| {
-        let before = input.offset();
-        match input.next() {
-            Some(Token::Ident(ident)) => Ok(ident),
-            None => {
-                let span = input.span_since(before);
-                Err(Rich::custom(span, "found end of input expected identifier"))
-            }
-            Some(token) => {
-                let span = input.span_since(before);
-                Err(Rich::custom(
-                    span,
-                    format!("found {token:?} expected identifier"),
-                ))
-            }
-        }
-    })
+    select! {
+        Token::Ident(ident) => ident,
+    }
 }
 
 fn parse_int<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, i64> {
@@ -146,19 +136,30 @@ fn parse_expr<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Expr<'bump>> {
 fn parse_list<'src, 'bump: 'src, O: 'bump>(
     p: impl Parser<'src, 'bump, O>,
 ) -> impl Parser<'src, 'bump, &'bump [O]> {
-    just(Token::Open)
-        .ignore_then(p.repeated().collect_bump_vec().map(|v| v.into_bump_slice()))
-        .then_ignore(just(Token::Close))
+    p.repeated()
+        .collect_bump_vec()
+        .map(|v| v.into_bump_slice())
+        .delimited_by(just(Token::Open), just(Token::Close))
+}
+
+fn parse_func_body<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, FuncBody<'bump>> {
+    parse_list(parse_expr()).map(|steps| FuncBody { steps })
 }
 
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
-pub struct FileNode<'bump>(&'bump [FuncNode<'bump>]);
+pub struct File<'bump>(&'bump [Func<'bump>]);
+
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
-struct FuncNode<'bump> {
+struct Func<'bump> {
     name: Ident,
     args: &'bump [Option<Ident>],
     types: &'bump [Expr<'bump>],
-    body: Expr<'bump>,
+    body: FuncBody<'bump>,
+}
+
+#[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
+struct FuncBody<'bump> {
+    steps: &'bump [Expr<'bump>],
 }
 
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]

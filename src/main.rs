@@ -27,7 +27,7 @@ fn main() {
         "
 (func mnist (state batch input)
     (
-        (join (dense_state _ _) (dense_state _ _) (dense_state _ _))
+        (join (dense_state _ 16) (dense_state _ 16) (dense_state _ 10))
         natural
         (tensor batch 784 _)
     )
