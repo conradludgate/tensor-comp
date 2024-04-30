@@ -5,15 +5,19 @@ use chumsky::{
     primitive::{choice, custom, just},
     recursive::recursive,
     util::Maybe,
-    IterParser, Parser,
 };
+
+type Tokens<'src> = WithContext<Span, SpannedInput<Token, Span, &'src [(Token, Span)]>>;
+type Extras<'src, 'bump> = Full<Rich<'src, Token, Span>, State<'bump>, Context>;
+pub trait Parser<'src, 'bump: 'src, O: 'bump> =
+    chumsky::Parser<'src, Tokens<'src>, O, Extras<'src, 'bump>> + Clone;
+trait IterParser<'src, 'bump: 'src, O: 'bump> =
+    chumsky::IterParser<'src, Tokens<'src>, O, Extras<'src, 'bump>> + Clone;
 
 use crate::{
     span::Span,
     token::{Ident, Token},
 };
-
-type Tokens<'src> = WithContext<Span, SpannedInput<Token, Span, &'src [(Token, Span)]>>;
 
 pub struct State<'bump> {
     pub bump: &'bump bumpalo::Bump,
@@ -23,17 +27,11 @@ pub struct State<'bump> {
 #[derive(Clone, Copy, Default)]
 pub struct Context {}
 
-type E<'src, 'bump> = Full<Rich<'src, Token, Span>, State<'bump>, Context>;
-
-trait IterParserExt<'src, 'bump: 'src, O: 'bump>:
-    IterParser<'src, Tokens<'src>, O, E<'src, 'bump>> + Clone
-{
-    fn collect_bump_vec(
-        self,
-    ) -> impl Parser<'src, Tokens<'src>, bumpalo::collections::Vec<'bump, O>, E<'src, 'bump>> + Clone
-    {
-        let vec =
-            custom::<_, _, _, E>(|input| Ok(bumpalo::collections::Vec::new_in(input.state().bump)));
+trait IterParserExt<'src, 'bump: 'src, O: 'bump>: IterParser<'src, 'bump, O> {
+    fn collect_bump_vec(self) -> impl Parser<'src, 'bump, bumpalo::collections::Vec<'bump, O>> {
+        let vec = custom::<_, _, _, Extras>(|input| {
+            Ok(bumpalo::collections::Vec::new_in(input.state().bump))
+        });
 
         vec.foldl(self, |mut vec, item| {
             vec.push(item);
@@ -43,20 +41,18 @@ trait IterParserExt<'src, 'bump: 'src, O: 'bump>:
 }
 
 impl<'src, 'bump: 'src, O: 'bump, P> IterParserExt<'src, 'bump, O> for P where
-    P: IterParser<'src, Tokens<'src>, O, E<'src, 'bump>> + Clone
+    P: IterParser<'src, 'bump, O>
 {
 }
 
-pub fn parse_file<'src, 'bump: 'src>(
-) -> impl Parser<'src, Tokens<'src>, FileNode<'bump>, E<'src, 'bump>> + Clone {
+pub fn parse_file<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, FileNode<'bump>> {
     parse_func()
         .repeated()
         .collect_bump_vec()
         .map(|vec| FileNode(vec.into_bump_slice()))
 }
 
-fn parse_func<'src, 'bump: 'src>(
-) -> impl Parser<'src, Tokens<'src>, FuncNode<'bump>, E<'src, 'bump>> + Clone {
+fn parse_func<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, FuncNode<'bump>> {
     just(Token::Open)
         .ignore_then(parse_ident_exact(|s| s.func))
         .ignore_then(parse_ident())
@@ -74,8 +70,8 @@ fn parse_func<'src, 'bump: 'src>(
 
 fn parse_ident_exact<'src, 'bump: 'src>(
     ident_from_state: impl for<'a> Fn(&'a State) -> Ident + Clone,
-) -> impl Parser<'src, Tokens<'src>, Ident, E<'src, 'bump>> + Clone {
-    custom::<_, _, _, E>(move |input| {
+) -> impl Parser<'src, 'bump, Ident> {
+    custom::<_, _, _, Extras>(move |input| {
         let expected = ident_from_state(input.state());
         let before = input.offset();
         match input.next() {
@@ -92,14 +88,12 @@ fn parse_ident_exact<'src, 'bump: 'src>(
     })
 }
 
-fn parse_ident_or_infer<'src, 'bump: 'src>(
-) -> impl Parser<'src, Tokens<'src>, Option<Ident>, E<'src, 'bump>> + Clone {
+fn parse_ident_or_infer<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Option<Ident>> {
     parse_ident().map(Some).or(just(Token::Infer).map(|_| None))
 }
 
-fn parse_ident<'src, 'bump: 'src>() -> impl Parser<'src, Tokens<'src>, Ident, E<'src, 'bump>> + Clone
-{
-    custom::<_, _, _, E>(|input| {
+fn parse_ident<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Ident> {
+    custom::<_, _, _, Extras>(|input| {
         let before = input.offset();
         match input.next() {
             Some(Token::Ident(ident)) => Ok(ident),
@@ -118,8 +112,8 @@ fn parse_ident<'src, 'bump: 'src>() -> impl Parser<'src, Tokens<'src>, Ident, E<
     })
 }
 
-fn parse_int<'src, 'bump: 'src>() -> impl Parser<'src, Tokens<'src>, i64, E<'src, 'bump>> + Clone {
-    custom::<_, _, _, E>(|input| {
+fn parse_int<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, i64> {
+    custom::<_, _, _, Extras>(|input| {
         let before = input.offset();
         match input.next() {
             Some(Token::Int(int)) => Ok(int),
@@ -138,8 +132,7 @@ fn parse_int<'src, 'bump: 'src>() -> impl Parser<'src, Tokens<'src>, i64, E<'src
     })
 }
 
-fn parse_expr<'src, 'bump: 'src>(
-) -> impl Parser<'src, Tokens<'src>, Expr<'bump>, E<'src, 'bump>> + Clone {
+fn parse_expr<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Expr<'bump>> {
     recursive(|expr| {
         choice((
             parse_ident().map(Expr::Ident),
@@ -151,8 +144,8 @@ fn parse_expr<'src, 'bump: 'src>(
 }
 
 fn parse_list<'src, 'bump: 'src, O: 'bump>(
-    p: impl Parser<'src, Tokens<'src>, O, E<'src, 'bump>> + Clone,
-) -> impl Parser<'src, Tokens<'src>, &'bump [O], E<'src, 'bump>> + Clone {
+    p: impl Parser<'src, 'bump, O>,
+) -> impl Parser<'src, 'bump, &'bump [O]> {
     just(Token::Open)
         .ignore_then(p.repeated().collect_bump_vec().map(|v| v.into_bump_slice()))
         .then_ignore(just(Token::Close))
@@ -177,8 +170,9 @@ enum Expr<'bump> {
     List(&'bump [Expr<'bump>]),
 }
 
-impl dbg_pls::DebugPls for Ident {
-    fn fmt(&self, f: dbg_pls::Formatter<'_>) {
-        f.debug_ident("Ident")
+#[cfg(feature = "_debugging")]
+impl dbg_pls::DebugWith<lasso::Rodeo<Ident>> for Ident {
+    fn fmt(&self, with: &lasso::Rodeo<Ident>, f: dbg_pls::Formatter<'_>) {
+        with.resolve(self).fmt(&(), f)
     }
 }

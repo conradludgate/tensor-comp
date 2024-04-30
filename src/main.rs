@@ -1,3 +1,5 @@
+#![feature(trait_alias)]
+
 use ariadne::{Label, Report};
 use bumpalo::Bump;
 use chumsky::{input::Input, span::Span as ISpan, Parser};
@@ -84,7 +86,7 @@ fn main() {
         .into_result()
     {
         Ok(file) => {
-            dbg_pls::color!(file);
+            dbg_pls::color_with!(&lex.extras.idents, file);
         }
         Err(errors) => {
             for error in errors {

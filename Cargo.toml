@@ -19,4 +19,7 @@ lasso = "0.7.2"
 chumsky = "1.0.0-alpha.7"
 bumpalo = { version = "3.16.0", features = ["collections"] }
 
-dbg-pls = { version = "0.4", features = ["derive", "colors"], optional = true }
+dbg-pls = { git = "https://github.com/conradludgate/dbg-pls", branch = "main", features = [
+    "derive",
+    "colors",
+], optional = true }
