@@ -8,12 +8,14 @@ use logos::Logos;
 use crate::{
     file::FileCache,
     parse::{parse_file, State},
+    scope::Scoped,
     span::Span,
     token::Token,
 };
 
 mod file;
 mod parse;
+mod scope;
 mod span;
 mod token;
 
@@ -75,19 +77,20 @@ fn main() {
         return;
     }
 
+    let bump_parse = Bump::new();
     let mut state = State {
-        bump: &Bump::new(),
+        bump: &bump_parse,
         func: lex.extras.idents.get_or_intern_static("func"),
+        split: lex.extras.idents.get_or_intern_static("split"),
     };
 
     let tokens = tokens.as_slice().spanned(eoi).with_context(file);
-    match parse_file()
+
+    let file = match parse_file()
         .parse_with_state(tokens, &mut state)
         .into_result()
     {
-        Ok(file) => {
-            dbg_pls::color_with!(&lex.extras.idents, file);
-        }
+        Ok(file) => dbg_pls::color_with!(&lex.extras.idents, file),
         Err(errors) => {
             for error in errors {
                 Report::build(
@@ -100,6 +103,12 @@ fn main() {
                 .eprint(&mut files)
                 .unwrap();
             }
+            return;
         }
     };
+
+    let scoped_bump = Bump::new();
+    let mut scoped = Scoped::new(&scoped_bump);
+    let scoped_file = scoped.map_file(&file);
+    dbg_pls::color_with!(&lex.extras.idents, scoped_file);
 }

@@ -23,9 +23,10 @@ use crate::{
 pub struct State<'bump> {
     pub bump: &'bump bumpalo::Bump,
     pub func: Ident,
+    pub split: Ident,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Context {}
 
 trait IterParserExt<'src, 'bump: 'src, O: 'bump>: IterParser<'src, 'bump, O> {
@@ -46,21 +47,33 @@ impl<'src, 'bump: 'src, O: 'bump, P> IterParserExt<'src, 'bump, O> for P where
 {
 }
 
+trait ParserExt<'src, 'bump: 'src, O: 'bump>: Parser<'src, 'bump, O> {
+    fn alloc(self) -> impl Parser<'src, 'bump, &'bump O> {
+        self.repeated()
+            .exactly(1)
+            .collect_bump_vec()
+            .map(|o| o.into_bump_slice().first().expect("exactly one item"))
+    }
+}
+
+impl<'src, 'bump: 'src, O: 'bump, P> ParserExt<'src, 'bump, O> for P where P: Parser<'src, 'bump, O> {}
+
 pub fn parse_file<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, File<'bump>> {
-    parse_func()
+    parse_func(parse_expr())
         .repeated()
         .collect_bump_vec()
         .map(|vec| File(vec.into_bump_slice()))
 }
 
-fn parse_func<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Func<'bump>> {
-    just(Token::Open)
-        .ignore_then(parse_ident_exact(|s| s.func))
+fn parse_func<'src, 'bump: 'src>(
+    expr: impl Parser<'src, 'bump, Expr<'bump>>,
+) -> impl Parser<'src, 'bump, Func<'bump>> {
+    parse_ident_exact(|s| s.func)
         .ignore_then(parse_ident())
-        .then(parse_list(parse_ident_or_infer()))
-        .then(parse_list(parse_expr()))
-        .then(parse_func_body())
-        .then_ignore(just(Token::Close))
+        .then(parse_list(parse_ident()))
+        .then(parse_list(expr.clone()))
+        .then(parse_func_body(expr))
+        .delimited_by(just(Token::Open), just(Token::Close))
         .map(|(((name, args), types), body)| Func {
             name,
             args,
@@ -87,13 +100,6 @@ fn parse_ident_exact<'src, 'bump: 'src>(
             }
         }
     })
-}
-
-fn parse_ident_or_infer<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Option<Ident>> {
-    select! {
-        Token::Ident(ident) => Some(ident),
-        Token::Infer => None,
-    }
 }
 
 fn parse_ident<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Ident> {
@@ -128,9 +134,31 @@ fn parse_expr<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, Expr<'bump>> {
             parse_ident().map(Expr::Ident),
             just(Token::Infer).map(|_| Expr::Infer),
             parse_int().map(Expr::Int),
-            parse_list(expr).map(Expr::List),
+            parse_func_call(expr).map(Expr::Call),
         ))
     })
+}
+
+fn parse_func_call<'src, 'bump: 'src>(
+    expr: impl Parser<'src, 'bump, Expr<'bump>>,
+) -> impl Parser<'src, 'bump, FuncCall<'bump>> {
+    choice((
+        parse_split_func_call(expr.clone()).map(FuncCall::Split),
+        expr.repeated()
+            .collect_bump_vec()
+            .map(|v| FuncCall::Arbitrary(v.into_bump_slice())),
+    ))
+    .delimited_by(just(Token::Open), just(Token::Close))
+}
+
+fn parse_split_func_call<'src, 'bump: 'src>(
+    expr: impl Parser<'src, 'bump, Expr<'bump>>,
+) -> impl Parser<'src, 'bump, SplitFuncCall<'bump>> {
+    parse_ident_exact(|s| s.split)
+        .ignore_then(expr.clone().alloc())
+        .then(parse_list(parse_ident()))
+        .then(parse_func_body(expr))
+        .map(|((arg, idents), body)| SplitFuncCall { arg, idents, body })
 }
 
 fn parse_list<'src, 'bump: 'src, O: 'bump>(
@@ -142,33 +170,66 @@ fn parse_list<'src, 'bump: 'src, O: 'bump>(
         .delimited_by(just(Token::Open), just(Token::Close))
 }
 
-fn parse_func_body<'src, 'bump: 'src>() -> impl Parser<'src, 'bump, FuncBody<'bump>> {
-    parse_list(parse_expr()).map(|steps| FuncBody { steps })
+fn parse_func_body<'src, 'bump: 'src>(
+    expr: impl Parser<'src, 'bump, Expr<'bump>>,
+) -> impl Parser<'src, 'bump, FuncBody<'bump>> {
+    parse_list(expr).map(|steps| FuncBody { steps })
 }
 
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
-pub struct File<'bump>(&'bump [Func<'bump>]);
+pub struct File<'bump>(pub &'bump [Func<'bump>]);
 
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
-struct Func<'bump> {
-    name: Ident,
-    args: &'bump [Option<Ident>],
-    types: &'bump [Expr<'bump>],
-    body: FuncBody<'bump>,
+pub struct Func<'bump> {
+    pub name: Ident,
+    pub args: &'bump [Ident],
+    pub types: &'bump [Expr<'bump>],
+    pub body: FuncBody<'bump>,
 }
 
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
-struct FuncBody<'bump> {
-    steps: &'bump [Expr<'bump>],
+pub struct FuncBody<'bump> {
+    pub steps: &'bump [Expr<'bump>],
 }
 
 #[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
-enum Expr<'bump> {
+pub enum Expr<'bump> {
     Ident(Ident),
     Infer,
     // Float(f64),
     Int(i64),
-    List(&'bump [Expr<'bump>]),
+    Call(FuncCall<'bump>),
+}
+
+pub enum FuncCall<'bump> {
+    Split(SplitFuncCall<'bump>),
+    Arbitrary(&'bump [Expr<'bump>]),
+}
+
+#[cfg(feature = "_debugging")]
+impl<T> dbg_pls::DebugWith<T> for FuncCall<'_>
+where
+    Ident: dbg_pls::DebugWith<T>,
+{
+    fn fmt(&self, with: &T, f: dbg_pls::Formatter<'_>) {
+        match self {
+            FuncCall::Split(split) => f
+                .debug_tuple_struct("Split")
+                .field_with(split as _, with)
+                .finish(),
+            FuncCall::Arbitrary(arbitrary) => f
+                .debug_tuple_struct("Arbitrary")
+                .field_with(arbitrary as _, with)
+                .finish(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "_debugging", derive(dbg_pls::DebugPls))]
+pub struct SplitFuncCall<'bump> {
+    pub arg: &'bump Expr<'bump>,
+    pub idents: &'bump [Ident],
+    pub body: FuncBody<'bump>,
 }
 
 #[cfg(feature = "_debugging")]
